@@ -1,0 +1,52 @@
+{
+  "name": "@pipulpant/playwright-testmo-reporter",
+  "version": "1.0.3",
+  "description": "Playwright reporter for Testmo - automatically submit test results with C{ID} linking",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "sync-testmo": "./dist/cli/sync.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "playwright",
+    "testmo",
+    "reporter",
+    "test-automation",
+    "ci-cd",
+    "test-results"
+  ],
+  "author": "Pipul Pant",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipulpant/playwright-testmo-reporter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pipulpant/playwright-testmo-reporter/issues"
+  },
+  "homepage": "https://github.com/pipulpant/playwright-testmo-reporter#readme",
+  "peerDependencies": {
+    "@playwright/test": "^1.20.0"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.1",
+    "typescript": "^5.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
