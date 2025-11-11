@@ -117,6 +117,7 @@ MIT
 ## Support
 
 For issues or questions:
+- GitHub Repository: https://github.com/PipulPant/playwright-testmo-reporter
 - Check Testmo API documentation: https://docs.testmo.com/api
 - Review console output for detailed error messages
 - Verify your Testmo plan includes Automation API access

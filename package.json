@@ -24,12 +24,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipulpant/playwright-testmo-reporter.git"
+    "url": "https://github.com/PipulPant/playwright-testmo-reporter.git"
   },
   "bugs": {
-    "url": "https://github.com/pipulpant/playwright-testmo-reporter/issues"
+    "url": "https://github.com/PipulPant/playwright-testmo-reporter/issues"
   },
-  "homepage": "https://github.com/pipulpant/playwright-testmo-reporter#readme",
+  "homepage": "https://github.com/PipulPant/playwright-testmo-reporter#readme",
   "peerDependencies": {
     "@playwright/test": "^1.20.0"
   },
