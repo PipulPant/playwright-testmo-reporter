@@ -3,6 +3,10 @@
  * Handles communication with Testmo REST API for test case retrieval and result submission
  */
 
+import { logger } from './logger';
+import { validateConfig, type TestmoConfig } from './config';
+import { DEFAULT_TIMEOUT, API_ENDPOINTS, VALID_SOURCES, DEFAULT_SOURCE } from './constants';
+
 interface TestmoTestCase {
   id: number;
   name: string;
@@ -40,38 +44,94 @@ export class TestmoClient {
   private projectId: number;
   private groupId: number | null;
   private testCasesCache: Map<string, TestmoTestCase> | null = null;
+  private config: TestmoConfig | null = null;
+  private timeout: number;
 
-  constructor() {
-    let url = process.env.TESTMO_URL || '';
-    // Remove trailing slash if present
-    this.baseUrl = url.replace(/\/$/, '');
-    this.token = process.env.TESTMO_TOKEN || '';
-    // Support both TESTMO_PROJECT_ID and TESTMO_REPOSITORY_ID for backward compatibility
-    this.projectId = parseInt(process.env.TESTMO_PROJECT_ID || process.env.TESTMO_REPOSITORY_ID || '1', 10);
-    // Get group_id from environment variable if provided
-    this.groupId = process.env.TESTMO_GROUP_ID ? parseInt(process.env.TESTMO_GROUP_ID, 10) : null;
+  /**
+   * Creates a new TestmoClient instance
+   * 
+   * @param config - Optional Testmo configuration. If not provided, will attempt to load from environment variables.
+   * @throws {Error} If configuration is invalid
+   */
+  constructor(config?: TestmoConfig) {
+    try {
+      this.config = config || validateConfig();
+      this.baseUrl = this.config.url;
+      this.token = this.config.token;
+      this.projectId = this.config.projectId;
+      this.groupId = this.config.groupId || null;
+      this.timeout = this.config.timeout;
+    } catch (error) {
+      // Fallback to old behavior for backward compatibility
+      let url = process.env.TESTMO_URL || '';
+      this.baseUrl = url.replace(/\/$/, '');
+      this.token = process.env.TESTMO_TOKEN || '';
+      this.projectId = parseInt(process.env.TESTMO_PROJECT_ID || process.env.TESTMO_REPOSITORY_ID || '1', 10);
+      this.groupId = process.env.TESTMO_GROUP_ID ? parseInt(process.env.TESTMO_GROUP_ID, 10) : null;
+      this.timeout = parseInt(process.env.TESTMO_TIMEOUT || String(DEFAULT_TIMEOUT), 10);
 
-    if (!this.baseUrl || !this.token) {
-      console.warn('⚠️  Testmo credentials not configured. Set TESTMO_URL and TESTMO_TOKEN environment variables.');
+      if (!this.baseUrl || !this.token) {
+        logger.warn('Testmo credentials not configured. Set TESTMO_URL and TESTMO_TOKEN environment variables.');
+      }
     }
   }
 
   /**
    * Check if Testmo is properly configured
+   * 
+   * @returns {boolean} True if Testmo is configured with valid credentials
    */
   isConfigured(): boolean {
     return !!this.baseUrl && !!this.token;
   }
 
   /**
+   * Makes a fetch request with timeout and error handling
+   * 
+   * @param url - The URL to fetch
+   * @param options - Fetch options
+   * @returns {Promise<Response>} The fetch response
+   * @throws {Error} If the request times out or fails
+   */
+  private async fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      return response;
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new Error(`Request to ${url} timed out after ${this.timeout}ms. Check your network connection or increase TESTMO_TIMEOUT.`);
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Fetch all test cases from Testmo repository
+   * 
+   * @returns {Promise<TestmoTestCase[]>} Array of test cases from Testmo
+   * 
+   * @example
+   * ```typescript
+   * const testCases = await client.fetchTestCases();
+   * console.log(`Fetched ${testCases.length} test cases`);
+   * ```
    */
   async fetchTestCases(): Promise<TestmoTestCase[]> {
     if (!this.isConfigured()) {
+      logger.warn('Cannot fetch test cases: Testmo not configured');
       return [];
     }
 
     if (this.testCasesCache) {
+      logger.debug('Returning cached test cases', { count: this.testCasesCache.size });
       return Array.from(this.testCasesCache.values());
     }
 
@@ -85,26 +145,27 @@ export class TestmoClient {
       const queryParams = new URLSearchParams();
       if (this.groupId) {
         queryParams.append('group_id', this.groupId.toString());
-        console.log(`🎯 Filtering test cases by group_id: ${this.groupId}`);
+        logger.info(`Filtering test cases by group_id: ${this.groupId}`);
       }
       const queryString = queryParams.toString();
       const querySuffix = queryString ? `?${queryString}` : '';
 
       // Try different possible API endpoint structures
       const endpoints = [
-        `${this.baseUrl}/api/v1/projects/${this.projectId}/cases${querySuffix}`,
-        `${this.baseUrl}/api/v1/repositories/${this.projectId}/cases${querySuffix}`,
-        `${this.baseUrl}/api/v1/projects/${this.projectId}/testcases${querySuffix}`,
+        `${this.baseUrl}${API_ENDPOINTS.CASES.replace('{id}', String(this.projectId))}${querySuffix}`,
+        `${this.baseUrl}${API_ENDPOINTS.CASES_REPO.replace('{id}', String(this.projectId))}${querySuffix}`,
+        `${this.baseUrl}${API_ENDPOINTS.CASES_TESTCASES.replace('{id}', String(this.projectId))}${querySuffix}`,
       ];
 
       let data: any = null;
       let lastError: Error | null = null;
+      let successfulEndpoint = '';
 
       for (const url of endpoints) {
         try {
-          console.log(`🔍 Trying endpoint: ${url}`);
+          logger.debug(`Trying endpoint: ${url}`);
           
-          const response = await fetch(url, {
+          const response = await this.fetchWithTimeout(url, {
             method: 'GET',
             headers: {
               'Authorization': `Bearer ${this.token}`,
@@ -114,23 +175,27 @@ export class TestmoClient {
 
           if (!response.ok) {
             const errorText = await response.text();
-            console.log(`⚠️  Endpoint failed: ${response.status} ${response.statusText}`);
-            lastError = new Error(`Failed: ${response.status} - ${errorText}`);
+            logger.debug(`Endpoint failed: ${response.status} ${response.statusText}`, { error: errorText.substring(0, 200) });
+            lastError = new Error(`API request failed with status ${response.status}: ${errorText.substring(0, 200)}`);
             continue; // Try next endpoint
           }
 
           data = await response.json();
-          console.log(`✅ Success with endpoint: ${url}`);
+          successfulEndpoint = url;
+          logger.success(`Successfully connected to Testmo API: ${url}`);
           break; // Success, exit loop
         } catch (error: any) {
-          console.log(`⚠️  Endpoint error: ${error.message}`);
+          logger.debug(`Endpoint error: ${error.message}`);
           lastError = error;
           continue; // Try next endpoint
         }
       }
 
       if (!data) {
-        throw lastError || new Error('All API endpoints failed');
+        const errorMessage = lastError 
+          ? `Failed to fetch test cases from Testmo. ${lastError.message}`
+          : 'All API endpoints failed. Please check your TESTMO_URL and TESTMO_PROJECT_ID.';
+        throw new Error(errorMessage);
       }
       
       // Handle pagination - Testmo API returns paginated results
@@ -146,25 +211,26 @@ export class TestmoClient {
       const pageTestCases = data.result || data.cases || data.data?.cases || data.items || data.data?.items || data.testcases || [];
       allTestCases = [...pageTestCases];
       
-      console.log(`📄 Page ${currentPage} of ${lastPage}: Found ${pageTestCases.length} test cases (Total: ${total})`);
+      logger.info(`Page ${currentPage} of ${lastPage}: Found ${pageTestCases.length} test cases (Total: ${total})`);
       
       // Fetch remaining pages if there are more
       if (lastPage > 1 && currentPage < lastPage) {
-        console.log(`📥 Fetching remaining pages (${lastPage - currentPage} more pages)...`);
+        const remainingPages = lastPage - currentPage;
+        logger.progress(`Fetching remaining pages (${remainingPages} more pages)...`);
         
         for (let page = currentPage + 1; page <= lastPage; page++) {
           try {
             // Build URL with pagination and group_id
-            const baseUrl = endpoints[0].split('?')[0]; // Get base URL without query params
+            const baseUrl = successfulEndpoint.split('?')[0]; // Get base URL without query params
             const pageParams = new URLSearchParams();
             if (this.groupId) {
               pageParams.append('group_id', this.groupId.toString());
             }
             pageParams.append('page', page.toString());
             const pageUrl = `${baseUrl}?${pageParams.toString()}`;
-            console.log(`🔍 Fetching page ${page}/${lastPage}...`);
+            logger.debug(`Fetching page ${page}/${lastPage}...`);
             
-            const pageResponse = await fetch(pageUrl, {
+            const pageResponse = await this.fetchWithTimeout(pageUrl, {
               method: 'GET',
               headers: {
                 'Authorization': `Bearer ${this.token}`,
@@ -176,12 +242,12 @@ export class TestmoClient {
               const pageData: any = await pageResponse.json();
               const pageCases = pageData.result || pageData.cases || [];
               allTestCases = [...allTestCases, ...pageCases];
-              console.log(`✅ Page ${page}: Found ${pageCases.length} test cases`);
+              logger.debug(`Page ${page}: Found ${pageCases.length} test cases`);
             } else {
-              console.log(`⚠️  Failed to fetch page ${page}: ${pageResponse.status}`);
+              logger.warn(`Failed to fetch page ${page}: ${pageResponse.status}`);
             }
           } catch (error: any) {
-            console.log(`⚠️  Error fetching page ${page}: ${error.message}`);
+            logger.warn(`Error fetching page ${page}: ${error.message}`);
           }
         }
       }
@@ -202,16 +268,26 @@ export class TestmoClient {
         }
       });
 
-      console.log(`✅ Fetched ${testCases.length} test cases from Testmo project ${this.projectId}`);
+      logger.success(`Fetched ${testCases.length} test cases from Testmo project ${this.projectId}`);
       return testCases;
-    } catch (error) {
-      console.error('❌ Error fetching test cases from Testmo:', error);
+    } catch (error: any) {
+      logger.error('Error fetching test cases from Testmo', error);
       return [];
     }
   }
 
   /**
    * Find a test case by matching test name
+   * 
+   * @param testName - The name of the test to find
+   * @param filePath - Optional file path to help with matching
+   * @returns {Promise<TestmoTestCase | null>} The matching test case or null if not found
+   * 
+   * @example
+   * ```typescript
+   * const testCase = await client.findTestCaseByTestName('Login test', './tests/login.spec.ts');
+   * if (testCase) console.log(`Found: ${testCase.name}`);
+   * ```
    */
   async findTestCaseByTestName(testName: string, filePath?: string): Promise<TestmoTestCase | null> {
     if (!this.isConfigured()) {
@@ -271,6 +347,20 @@ export class TestmoClient {
   /**
    * Submit test results to Testmo using JUnit XML file (like Testmo CLI)
    * This method uploads the JUnit XML file directly, which Testmo can parse and link automatically
+   * 
+   * @param runName - Name for the test run in Testmo
+   * @param xmlFilePath - Path to the JUnit XML file
+   * @param source - Source identifier (e.g., 'playwright', 'ci', 'local')
+   * @returns {Promise<boolean>} True if submission was successful
+   * 
+   * @example
+   * ```typescript
+   * const success = await client.submitTestResultsFromXML(
+   *   'Nightly Test Run',
+   *   './test-results/results.xml',
+   *   'ci'
+   * );
+   * ```
    */
   async submitTestResultsFromXML(
     runName: string,
@@ -278,7 +368,7 @@ export class TestmoClient {
     source?: string
   ): Promise<boolean> {
     if (!this.isConfigured()) {
-      console.warn('⚠️  Testmo not configured, skipping result submission');
+      logger.warn('Testmo not configured, skipping result submission');
       return false;
     }
 
@@ -286,15 +376,14 @@ export class TestmoClient {
     const path = await import('path');
 
     if (!fs.existsSync(xmlFilePath)) {
-      console.error(`❌ JUnit XML file not found: ${xmlFilePath}`);
+      logger.error(`JUnit XML file not found: ${xmlFilePath}. Make sure you have the junit reporter configured in playwright.config.ts`);
       return false;
     }
 
     try {
       const xmlContent = fs.readFileSync(xmlFilePath, 'utf-8');
-      console.log(`\n📤 Submitting JUnit XML file to Testmo...`);
-      console.log(`   File: ${xmlFilePath}`);
-      console.log(`   Size: ${(xmlContent.length / 1024).toFixed(2)} KB`);
+      logger.progress('Submitting JUnit XML file to Testmo...');
+      logger.debug(`File: ${xmlFilePath}, Size: ${(xmlContent.length / 1024).toFixed(2)} KB`);
 
       // Try submitting XML as multipart form data (like Testmo CLI does)
       // In Node.js 18+, FormData and Blob are available globally
@@ -309,19 +398,19 @@ export class TestmoClient {
 
       // Try multiple endpoints - Testmo might use different endpoints for XML submission
       const endpoints = [
-        `${this.baseUrl}/api/v1/projects/${this.projectId}/automation/runs`,
-        `${this.baseUrl}/api/v1/projects/${this.projectId}/automation/runs/submit`,
-        `${this.baseUrl}/api/v1/automation/runs`,
-        `${this.baseUrl}/api/v1/automation/runs/submit`,
+        `${this.baseUrl}${API_ENDPOINTS.AUTOMATION_RUNS.replace('{id}', String(this.projectId))}`,
+        `${this.baseUrl}${API_ENDPOINTS.AUTOMATION_RUNS_SUBMIT.replace('{id}', String(this.projectId))}`,
+        `${this.baseUrl}${API_ENDPOINTS.AUTOMATION_RUNS_GLOBAL}`,
+        `${this.baseUrl}${API_ENDPOINTS.AUTOMATION_RUNS_GLOBAL_SUBMIT}`,
       ];
 
       let lastError: Error | null = null;
       
       for (const endpoint of endpoints) {
         try {
-          console.log(`   Trying endpoint: ${endpoint}`);
+          logger.debug(`Trying endpoint: ${endpoint}`);
           
-          const response = await fetch(endpoint, {
+          const response = await this.fetchWithTimeout(endpoint, {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${this.token}`,
@@ -340,44 +429,59 @@ export class TestmoClient {
               responseData = { message: responseText };
             }
             
-            console.log(`✅ Successfully submitted JUnit XML to Testmo`);
-            console.log(`   Endpoint: ${endpoint}`);
-            console.log(`   Run ID: ${responseData.id || responseData.run_id || 'N/A'}`);
-            console.log(`   View run: ${this.baseUrl}/projects/${this.projectId}/automation/runs/${responseData.id || responseData.run_id || ''}`);
+            const runId = responseData.id || responseData.run_id;
+            logger.success(`Successfully submitted JUnit XML to Testmo`);
+            logger.info(`Run ID: ${runId || 'N/A'}`);
+            if (runId) {
+              logger.info(`View run: ${this.baseUrl}/projects/${this.projectId}/automation/runs/${runId}`);
+            }
             
             // Try to complete the run
-            const runId = responseData.id || responseData.run_id;
             if (runId) {
               await this.completeRun(runId);
             }
             
             return true;
           } else {
-            console.log(`   ⚠️  Endpoint ${endpoint} failed: ${response.status} ${response.statusText}`);
-            console.log(`   Error: ${responseText.substring(0, 200)}`);
-            lastError = new Error(`Failed: ${response.status} - ${responseText.substring(0, 200)}`);
+            logger.debug(`Endpoint ${endpoint} failed: ${response.status} ${response.statusText}`);
+            logger.debug(`Error: ${responseText.substring(0, 200)}`);
+            lastError = new Error(`API request failed with status ${response.status}: ${responseText.substring(0, 200)}`);
             continue;
           }
         } catch (error: any) {
-          console.log(`   ⚠️  Endpoint ${endpoint} error: ${error.message}`);
+          logger.debug(`Endpoint ${endpoint} error: ${error.message}`);
           lastError = error;
           continue;
         }
       }
       
-      console.error(`❌ Failed to submit JUnit XML to all endpoints`);
+      logger.error(`Failed to submit JUnit XML to all endpoints`);
       if (lastError) {
-        console.error(`   Last error: ${lastError.message}`);
+        logger.error(`Last error: ${lastError.message}`);
       }
       return false;
     } catch (error: any) {
-      console.error(`❌ Error submitting JUnit XML: ${error.message}`);
+      logger.error(`Error submitting JUnit XML: ${error.message}`, error);
       return false;
     }
   }
 
   /**
    * Submit test results to Testmo
+   * 
+   * @param runName - Name for the test run in Testmo
+   * @param results - Array of test results to submit
+   * @param source - Source identifier (e.g., 'playwright', 'ci', 'local')
+   * @returns {Promise<boolean>} True if submission was successful
+   * 
+   * @example
+   * ```typescript
+   * const results = [
+   *   { case_id: 123, status: 'passed', duration: 1500 },
+   *   { case_id: 124, status: 'failed', error: 'Test failed' }
+   * ];
+   * const success = await client.submitTestResults('Test Run', results, 'ci');
+   * ```
    */
   async submitTestResults(
     runName: string,
@@ -385,33 +489,32 @@ export class TestmoClient {
     source?: string
   ): Promise<boolean> {
     if (!this.isConfigured()) {
-      console.warn('⚠️  Testmo not configured, skipping result submission');
+      logger.warn('Testmo not configured, skipping result submission');
       return false;
     }
 
     if (results.length === 0) {
-      console.log('ℹ️  No test results to submit');
+      logger.info('No test results to submit');
       return true;
     }
 
     try {
-      const correctEndpoint = `${this.baseUrl}/api/v1/projects/${this.projectId}/automation/runs`;
+      const correctEndpoint = `${this.baseUrl}${API_ENDPOINTS.AUTOMATION_RUNS.replace('{id}', String(this.projectId))}`;
       
       const validSources = [
-        'playwright',
-        'automation',
-        'ci',
-        'local',
-        source || 'playwright',
+        ...VALID_SOURCES,
+        source || DEFAULT_SOURCE,
       ].filter(s => s && /^[a-zA-Z0-9-]+$/.test(s));
 
       const payload = {
         name: runName,
-        source: validSources[0] || 'playwright',
+        source: validSources[0] || DEFAULT_SOURCE,
         results: results,
       };
 
-      const response = await fetch(correctEndpoint, {
+      logger.debug(`Submitting ${results.length} test results to Testmo`, { endpoint: correctEndpoint, runName });
+
+      const response = await this.fetchWithTimeout(correctEndpoint, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.token}`,
@@ -423,36 +526,41 @@ export class TestmoClient {
       if (response.ok) {
         const responseData: any = await response.json();
         const runId = responseData.id || responseData.run_id;
+        logger.success(`Successfully submitted ${results.length} test results to Testmo`);
         if (runId) {
+          logger.info(`Run ID: ${runId}`);
           await this.completeRun(runId);
         }
         return true;
       } else {
         const errorText = await response.text();
-        console.error(`❌ Failed to submit results: ${response.status} - ${errorText.substring(0, 200)}`);
+        logger.error(`Failed to submit results: ${response.status} - ${errorText.substring(0, 200)}`);
         return false;
       }
-    } catch (error) {
-      console.error('❌ Error submitting test results to Testmo:', error);
+    } catch (error: any) {
+      logger.error('Error submitting test results to Testmo', error);
       return false;
     }
   }
 
   /**
    * Complete a test run in Testmo
+   * 
+   * @param runId - The ID of the run to complete
+   * @private
    */
   private async completeRun(runId: number | string): Promise<void> {
-    console.log(`   🔄 Attempting to complete run ${runId}...`);
+    logger.debug(`Attempting to complete run ${runId}...`);
     try {
       const completeEndpoints = [
-        `${this.baseUrl}/api/v1/projects/${this.projectId}/automation/runs/${runId}/complete`,
-        `${this.baseUrl}/api/v1/automation/runs/${runId}/complete`,
-        `${this.baseUrl}/api/v1/repositories/${this.projectId}/automation/runs/${runId}/complete`,
+        `${this.baseUrl}${API_ENDPOINTS.RUN_COMPLETE.replace('{id}', String(this.projectId)).replace('{runId}', String(runId))}`,
+        `${this.baseUrl}${API_ENDPOINTS.RUN_COMPLETE_GLOBAL.replace('{runId}', String(runId))}`,
+        `${this.baseUrl}${API_ENDPOINTS.RUN_COMPLETE_REPO.replace('{id}', String(this.projectId)).replace('{runId}', String(runId))}`,
       ];
       
       for (const endpoint of completeEndpoints) {
         try {
-          const completeResponse = await fetch(endpoint, {
+          const completeResponse = await this.fetchWithTimeout(endpoint, {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${this.token}`,
@@ -461,23 +569,32 @@ export class TestmoClient {
           });
           
           if (completeResponse.ok) {
-            console.log(`   ✅ Run completed successfully`);
+            logger.debug(`Run ${runId} completed successfully`);
             return;
           }
         } catch (e: any) {
+          logger.debug(`Failed to complete run via ${endpoint}: ${e.message}`);
           // Continue to next endpoint
         }
       }
     } catch (e: any) {
-      // Silently fail
+      logger.debug(`Error completing run: ${e.message}`);
+      // Silently fail - completion is optional
     }
   }
 
   /**
    * Clear the test cases cache (useful for refreshing)
+   * 
+   * @example
+   * ```typescript
+   * client.clearCache();
+   * const freshCases = await client.fetchTestCases();
+   * ```
    */
   clearCache(): void {
     this.testCasesCache = null;
+    logger.debug('Test cases cache cleared');
   }
 }
 

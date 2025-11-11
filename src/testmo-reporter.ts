@@ -16,6 +16,8 @@ import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { TestmoClient } from './testmo-client';
+import { logger } from './logger';
+import { DEFAULT_RUN_NAME_PREFIX, MAX_BUFFER_SIZE } from './constants';
 
 const execAsync = promisify(exec);
 
@@ -34,20 +36,29 @@ export default class TestmoReporter implements Reporter {
   private runName: string;
   private startTime: number = 0;
 
+  /**
+   * Creates a new TestmoReporter instance
+   */
   constructor() {
     this.testmoClient = new TestmoClient();
-    this.runName = `Playwright Test Run - ${new Date().toISOString()}`;
+    this.runName = `${DEFAULT_RUN_NAME_PREFIX} - ${new Date().toISOString()}`;
   }
 
+  /**
+   * Called when test execution begins
+   * 
+   * @param config - Playwright configuration
+   * @param suite - Root test suite
+   */
   onBegin(config: FullConfig, suite: Suite) {
     this.startTime = Date.now();
     
     if (!this.testmoClient.isConfigured()) {
-      console.log('⚠️  Testmo reporter: Testmo not configured. Skipping Testmo integration.');
+      logger.warn('Testmo reporter: Testmo not configured. Skipping Testmo integration.');
       return;
     }
 
-    console.log('🔄 Testmo reporter: Extracting Testmo case IDs from test files...');
+    logger.progress('Testmo reporter: Extracting Testmo case IDs from test files...');
     this.extractTestmoIdsFromFiles(suite);
   }
 
@@ -63,7 +74,7 @@ export default class TestmoReporter implements Reporter {
         this.testCaseMap.set(testKey, testCaseId);
         mappedCount++;
         if (mappedCount <= 5) {
-          console.log(`   ✓ Detected: "${test.title.substring(0, 50)}..." → Case #${testCaseId}`);
+          logger.debug(`Detected: "${test.title.substring(0, 50)}..." → Case #${testCaseId}`);
         }
       } else {
         notMappedCount++;
@@ -71,10 +82,10 @@ export default class TestmoReporter implements Reporter {
     }
 
     const totalTests = suite.allTests().length;
-    console.log(`✅ Testmo reporter: Found Testmo IDs for ${mappedCount} of ${totalTests} tests`);
+    logger.success(`Testmo reporter: Found Testmo IDs for ${mappedCount} of ${totalTests} tests`);
     
     if (notMappedCount > 0) {
-      console.log(`⚠️  ${notMappedCount} tests don't have Testmo case IDs. Run 'sync-testmo' to add them.`);
+      logger.warn(`${notMappedCount} tests don't have Testmo case IDs. Run 'npx sync-testmo' to add them.`);
     }
   }
 
@@ -117,11 +128,19 @@ export default class TestmoReporter implements Reporter {
     return `${test.location.file}:${test.title}`;
   }
 
+  /**
+   * Converts Playwright test status to Testmo status
+   * 
+   * @param status - Playwright test status
+   * @returns {string} Testmo status
+   * @private
+   */
   private convertStatus(status: string): 'passed' | 'failed' | 'skipped' | 'blocked' {
     switch (status) {
       case 'passed':
         return 'passed';
       case 'failed':
+      case 'timedOut':
         return 'failed';
       case 'skipped':
       case 'interrupted':
@@ -173,6 +192,11 @@ export default class TestmoReporter implements Reporter {
     });
   }
 
+  /**
+   * Called when test execution ends
+   * 
+   * @param result - Full test execution result
+   */
   async onEnd(result: FullResult) {
     if (!this.testmoClient.isConfigured()) {
       return;
@@ -186,15 +210,16 @@ export default class TestmoReporter implements Reporter {
     const path = await import('path');
     
     if (fs.existsSync(xmlFilePath)) {
-      console.log(`\n🔄 Testmo reporter: Submitting JUnit XML via Testmo CLI (recommended method)...`);
+      logger.progress('Testmo reporter: Submitting JUnit XML via Testmo CLI (recommended method)...');
       
       const cliSuccess = await this.submitViaCLI(runName, xmlFilePath, process.env.CI ? 'ci' : 'playwright');
       
       if (cliSuccess) {
-        console.log('✅ Testmo reporter: Results submitted successfully via Testmo CLI');
+        logger.success('Testmo reporter: Results submitted successfully via Testmo CLI');
         return;
       }
       
+      logger.progress('Testmo reporter: CLI submission failed, trying JUnit XML API...');
       const xmlSuccess = await this.testmoClient.submitTestResultsFromXML(
         runName,
         xmlFilePath,
@@ -202,16 +227,17 @@ export default class TestmoReporter implements Reporter {
       );
       
       if (xmlSuccess) {
-        console.log('✅ Testmo reporter: Results submitted successfully via JUnit XML API');
+        logger.success('Testmo reporter: Results submitted successfully via JUnit XML API');
         return;
       }
     }
 
     if (this.testResults.length === 0) {
-      console.log('ℹ️  Testmo reporter: No test results to submit');
+      logger.info('Testmo reporter: No test results to submit');
       return;
     }
     
+    logger.progress(`Testmo reporter: Submitting ${this.testResults.length} test results via JSON API...`);
     const success = await this.testmoClient.submitTestResults(
       runName,
       this.testResults,
@@ -219,9 +245,9 @@ export default class TestmoReporter implements Reporter {
     );
 
     if (success) {
-      console.log('✅ Testmo reporter: Results submitted successfully');
+      logger.success('Testmo reporter: Results submitted successfully');
     } else {
-      console.error('❌ Testmo reporter: Failed to submit results');
+      logger.error('Testmo reporter: Failed to submit results');
     }
   }
 
@@ -257,15 +283,19 @@ export default class TestmoReporter implements Reporter {
           ...process.env,
           TESTMO_TOKEN: testmoToken,
         },
-        maxBuffer: 10 * 1024 * 1024,
+        maxBuffer: MAX_BUFFER_SIZE,
       });
 
       if (stdout) {
-        console.log(`   ${stdout}`);
+        logger.debug(`CLI output: ${stdout}`);
+      }
+      if (stderr) {
+        logger.debug(`CLI stderr: ${stderr}`);
       }
       
       return true;
     } catch (error: any) {
+      logger.debug(`CLI submission failed: ${error.message}`);
       return false;
     }
   }

@@ -1,7 +1,18 @@
 #!/usr/bin/env node
 /**
  * CLI tool to sync Testmo test case IDs with Playwright tests
- * Usage: sync-testmo
+ * 
+ * Usage:
+ *   sync-testmo [directory] [options]
+ * 
+ * Options:
+ *   --help, -h     Show help message
+ *   --verbose, -v  Enable verbose logging
+ * 
+ * Examples:
+ *   sync-testmo                    # Sync tests in ./tests directory
+ *   sync-testmo tests/e2e         # Sync tests in specific directory
+ *   sync-testmo --verbose          # Enable verbose output
  */
 
 import * as dotenv from 'dotenv';
@@ -10,6 +21,8 @@ dotenv.config();
 import * as fs from 'fs';
 import * as path from 'path';
 import { TestmoClient } from '../testmo-client';
+import { logger } from '../logger';
+import { validateConfig } from '../config';
 
 function normalizeText(text: string): string {
   return text
@@ -121,30 +134,80 @@ function findTestFiles(dir: string, fileList: string[] = []): string[] {
 }
 
 async function syncTestmoIds() {
-  console.log('🔄 Starting Testmo ID sync...\n');
+  // Parse command line arguments
+  const args = process.argv.slice(2);
+  const helpIndex = args.findIndex(arg => arg === '--help' || arg === '-h');
+  const verboseIndex = args.findIndex(arg => arg === '--verbose' || arg === '-v');
+  
+  if (helpIndex !== -1) {
+    console.log(`
+Usage: sync-testmo [directory] [options]
+
+Sync Testmo test case IDs with Playwright tests by adding C{ID} prefixes to test titles.
+
+Arguments:
+  directory              Test directory to scan (default: tests)
+
+Options:
+  --help, -h             Show this help message
+  --verbose, -v          Enable verbose logging for debugging
+
+Environment Variables:
+  TESTMO_URL             Your Testmo instance URL (required)
+  TESTMO_TOKEN           Your Testmo API token (required)
+  TESTMO_PROJECT_ID      Your Testmo project ID (required)
+  TESTMO_GROUP_ID        Optional: Filter by group ID
+  TESTMO_VERBOSE         Enable verbose logging (set to 'true')
+
+Examples:
+  sync-testmo                           # Sync tests in ./tests directory
+  sync-testmo tests/e2e/frontend       # Sync tests in specific directory
+  sync-testmo --verbose                # Enable verbose output
+  TESTMO_VERBOSE=true sync-testmo       # Enable verbose via env var
+
+For more information, visit:
+  https://github.com/PipulPant/playwright-testmo-reporter
+`);
+    process.exit(0);
+  }
+
+  const verbose = verboseIndex !== -1 || process.env.TESTMO_VERBOSE === 'true';
+  logger.setVerbose(verbose);
+  
+  const testDirArg = args.filter(arg => !arg.startsWith('--') && !arg.startsWith('-'))[0];
+  const testDir = testDirArg || 'tests';
+
+  logger.progress('Starting Testmo ID sync...\n');
+
+  // Validate configuration
+  try {
+    validateConfig();
+  } catch (error: any) {
+    logger.error('Configuration error', error);
+    process.exit(1);
+  }
 
   const testmoClient = new TestmoClient();
 
   if (!testmoClient.isConfigured()) {
-    console.error('❌ Testmo not configured. Please set TESTMO_URL, TESTMO_TOKEN, and TESTMO_PROJECT_ID in your .env file.');
+    logger.error('Testmo not configured. Please set TESTMO_URL, TESTMO_TOKEN, and TESTMO_PROJECT_ID in your .env file.');
     process.exit(1);
   }
 
-  console.log('📥 Fetching test cases from Testmo...');
+  logger.progress('Fetching test cases from Testmo...');
   const testCases = await testmoClient.fetchTestCases();
 
   if (testCases.length === 0) {
-    console.error('❌ No test cases found in Testmo project.');
+    logger.error('No test cases found in Testmo project. Please check your TESTMO_PROJECT_ID and TESTMO_GROUP_ID.');
     process.exit(1);
   }
 
-  console.log(`✅ Found ${testCases.length} test cases in Testmo project\n`);
+  logger.success(`Found ${testCases.length} test cases in Testmo project\n`);
 
-  const testDir = process.argv[2] || 'tests';
   const testFiles = findTestFiles(path.resolve(testDir));
 
-  console.log(`📁 Scanning tests in: ${testDir}`);
-  console.log(`📁 Found ${testFiles.length} test files\n`);
+  logger.info(`Scanning tests in: ${testDir}`);
+  logger.info(`Found ${testFiles.length} test files\n`);
 
   let totalMatched = 0;
   let totalUpdated = 0;
@@ -186,20 +249,24 @@ async function syncTestmoIds() {
           const newTitle = hasTestmoIdPrefix(test.title) 
             ? test.title.replace(/^C\d+\s/, `C${testCaseId} `)
             : `C${testCaseId} ${test.title}`;
-          console.log(`  ✓ [${match.confidence}] ${relativePath}:${test.line} → Testmo Case #${testCaseId}`);
-          console.log(`    "${test.title}" → "${newTitle}"`);
+          logger.info(`[${match.confidence}] ${relativePath}:${test.line} → Testmo Case #${testCaseId}`);
+          logger.debug(`  "${test.title}" → "${newTitle}"`);
         }
       }
     }
   }
 
-  console.log(`\n✅ Sync complete!`);
-  console.log(`   - Matched: ${totalMatched} tests`);
-  console.log(`   - Updated: ${updatedFiles.size} test files`);
+  logger.success('\nSync complete!');
+  logger.info(`   - Matched: ${totalMatched} tests`);
+  logger.info(`   - Updated: ${updatedFiles.size} test files`);
+  
+  if (totalMatched === 0) {
+    logger.warn('No tests were matched. Make sure your test names match Testmo case names.');
+  }
 }
 
 syncTestmoIds().catch((error) => {
-  console.error('❌ Error syncing Testmo IDs:', error);
+  logger.error('Error syncing Testmo IDs', error);
   process.exit(1);
 });
 
