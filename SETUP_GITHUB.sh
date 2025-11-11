@@ -37,3 +37,5 @@ echo ""
 echo "📝 Step 5: After pushing, update package.json with correct URLs"
 echo "    Then run: npm publish --access public"
 
+
+
