@@ -1,6 +1,6 @@
 {
   "name": "@pipulpant/playwright-testmo-reporter",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Playwright reporter for Testmo - automatically submit test results with C{ID} linking",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
